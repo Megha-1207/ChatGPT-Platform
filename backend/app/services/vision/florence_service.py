@@ -138,33 +138,36 @@ class Florence2VisionService:
 
     @classmethod
     def _prepare_image_and_uri(cls, image_input: Any) -> Tuple[Image.Image, str, Tuple[int, int]]:
-        """Normalize various image formats to PIL.Image and a valid data URI."""
+        """Normalize various image formats to PIL.Image and an optimized high-speed data URI."""
         if isinstance(image_input, Image.Image):
             img = image_input.convert("RGB")
-            buf = io.BytesIO()
-            img.save(buf, format="PNG")
-            b64_str = base64.b64encode(buf.getvalue()).decode("utf-8")
-            return img, f"data:image/png;base64,{b64_str}", img.size
-
-        if isinstance(image_input, str):
+        elif isinstance(image_input, str):
             raw_str = image_input.strip()
             if raw_str.startswith("data:image"):
                 b64_part = raw_str.split("base64,")[1]
                 img_bytes = base64.b64decode(b64_part)
-                img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-                return img, raw_str, img.size
             else:
                 img_bytes = base64.b64decode(raw_str)
-                img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-                data_uri = f"data:image/png;base64,{raw_str}"
-                return img, data_uri, img.size
-
-        if isinstance(image_input, (bytes, bytearray)):
+            img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+        elif isinstance(image_input, (bytes, bytearray)):
             img = Image.open(io.BytesIO(image_input)).convert("RGB")
-            b64_str = base64.b64encode(image_input).decode("utf-8")
-            return img, f"data:image/png;base64,{b64_str}", img.size
+        else:
+            raise ValueError("Unsupported image input format.")
 
-        raise ValueError("Unsupported image input format.")
+        orig_w, orig_h = img.size
+
+        # Optimize for Vision Language Model payload (max 1280px on longest side, JPEG 85)
+        # This prevents HTTP write timeouts from large uncompressed screenshot PNGs
+        vlm_img = img.copy()
+        if max(orig_w, orig_h) > 1280:
+            vlm_img.thumbnail((1280, 1280), Image.Resampling.LANCZOS)
+
+        buf = io.BytesIO()
+        vlm_img.save(buf, format="JPEG", quality=85, optimize=True)
+        b64_str = base64.b64encode(buf.getvalue()).decode("utf-8")
+        data_uri = f"data:image/jpeg;base64,{b64_str}"
+
+        return img, data_uri, (orig_w, orig_h)
 
     @classmethod
     def _run_groq_vision(
@@ -230,12 +233,12 @@ class Florence2VisionService:
                         ]
                     }
                 ],
-                "max_tokens": 600,
+                "max_tokens": 1024,
                 "temperature": 0.1
             }
 
             try:
-                with httpx.Client(timeout=45.0) as client:
+                with httpx.Client(timeout=60.0) as client:
                     res = client.post(url, headers=headers, json=payload)
                     if res.status_code == 200:
                         data = res.json()
